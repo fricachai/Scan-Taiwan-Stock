@@ -5,8 +5,12 @@ import streamlit as st
 import json
 import re
 from datetime import datetime
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+BASE_DIR = Path(__file__).resolve().parent
+STOCK_NAME_CACHE_FILE = BASE_DIR / "stock_name_cache.json"
 
 
 def calculate_cci(high, low, close, length=20):
@@ -61,21 +65,77 @@ def calculate_supertrend(high, low, close, period=6, multiplier=0.686):
     return direction, supertrend
 
 
-def calculate_kd(high, low, close, period=9, k_smooth=3, d_smooth=3):
-    """計算 KD 指標。"""
+def calculate_kdj(high, low, close, period=9, signal=3):
+    """計算 KDJ 指標，對齊常見的 9,3 設定。"""
     lowest_low = low.rolling(period).min()
     highest_high = high.rolling(period).max()
     rsv = ((close - lowest_low) / (highest_high - lowest_low)) * 100
     rsv = rsv.replace([np.inf, -np.inf], np.nan).fillna(0)
-    k_val = rsv.ewm(alpha=1 / k_smooth, adjust=False).mean()
-    d_val = k_val.ewm(alpha=1 / d_smooth, adjust=False).mean()
-    return k_val, d_val
+    k_val = rsv.ewm(alpha=1 / signal, adjust=False).mean()
+    d_val = k_val.ewm(alpha=1 / signal, adjust=False).mean()
+    j_val = 3 * k_val - 2 * d_val
+    return k_val, d_val, j_val
+
+
+@st.cache_data(show_spinner=False)
+def fetch_stock_name_from_isin_table(str_mode):
+    """從 TWSE ISIN 名單頁抓取股票代號與名稱。"""
+    url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={str_mode}"
+    tables = pd.read_html(url)
+    if not tables:
+        return {}
+
+    df = tables[0]
+    if df.empty:
+        return {}
+
+    df.columns = df.iloc[0]
+    df = df.iloc[1:].copy()
+
+    code_name_col = df.columns[0]
+    market_col = df.columns[3] if len(df.columns) > 3 else None
+    if market_col is not None:
+        df = df[df[market_col].astype(str).str.contains("股票", na=False)]
+
+    mapping = {}
+    for value in df[code_name_col].dropna():
+        cleaned = " ".join(str(value).split())
+        match = re.match(r"^(\d+)\s+(.+)$", cleaned)
+        if match:
+            mapping[match.group(1)] = match.group(2)
+    return mapping
+
+
+def load_stock_name_cache():
+    """載入本機股票名稱快取。"""
+    if not STOCK_NAME_CACHE_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(STOCK_NAME_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_stock_name_cache(cache):
+    """儲存本機股票名稱快取。"""
+    try:
+        STOCK_NAME_CACHE_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 @st.cache_data(show_spinner=False)
 def fetch_twse_stock_name(symbol):
-    """從 TWSE 月資料 API 的 title 欄位拆出股票名稱。"""
+    """取得股票名稱，優先使用本機快取，再退回官方來源。"""
     code = symbol.replace(".TW", "").replace(".TWO", "")
+    cache = load_stock_name_cache()
+    if code in cache and cache[code]:
+        return cache[code]
+
     month_starts = [
         pd.Timestamp.today().replace(day=1),
         pd.Timestamp.today().replace(day=1) - pd.DateOffset(months=1),
@@ -116,7 +176,27 @@ def fetch_twse_stock_name(symbol):
 
         stock_name = next((part for part in match.group(1).split(" ") if part), "")
         if stock_name:
+            cache[code] = stock_name
+            save_stock_name_cache(cache)
             return stock_name
+
+    for str_mode in ("2", "4"):
+        mapping = fetch_stock_name_from_isin_table(str_mode)
+        if code in mapping:
+            cache[code] = mapping[code]
+            save_stock_name_cache(cache)
+            return mapping[code]
+
+    try:
+        ticker = yf.Ticker(f"{code}.TW")
+        info = ticker.info or {}
+        fallback_name = info.get("shortName") or info.get("longName") or ""
+        if fallback_name:
+            cache[code] = fallback_name
+            save_stock_name_cache(cache)
+            return fallback_name
+    except Exception:
+        pass
 
     return "查無名稱"
 
@@ -142,7 +222,7 @@ def check_taiwan_stock(symbol, strict_trend=True):
     direction, _ = calculate_supertrend(high, low, close, period=6, multiplier=0.686)
     cci_val = calculate_cci(high, low, close, length=20)
     cci_ma = cci_val.rolling(14).mean()
-    k_val, d_val = calculate_kd(high, low, close)
+    k_val, d_val, j_val = calculate_kdj(high, low, close, period=9, signal=3)
 
     current_idx = -1
     prev_idx = -2
@@ -170,6 +250,7 @@ def check_taiwan_stock(symbol, strict_trend=True):
             "CCI 數值": round(float(cci_val.iloc[current_idx]), 2),
             "K 值": round(float(k_val.iloc[current_idx]), 2),
             "D 值": round(float(d_val.iloc[current_idx]), 2),
+            "J 值": round(float(j_val.iloc[current_idx]), 2),
             "Supertrend 狀態": "🟢 多頭" if is_green_trend else "🔴 空頭",
             "交易日": df.index[-1].strftime("%Y-%m-%d"),
         }
