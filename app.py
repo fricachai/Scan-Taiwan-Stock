@@ -6,7 +6,7 @@ import json
 import re
 from datetime import datetime
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 def calculate_cci(high, low, close, length=20):
@@ -61,6 +61,17 @@ def calculate_supertrend(high, low, close, period=6, multiplier=0.686):
     return direction, supertrend
 
 
+def calculate_kd(high, low, close, period=9, k_smooth=3, d_smooth=3):
+    """計算 KD 指標。"""
+    lowest_low = low.rolling(period).min()
+    highest_high = high.rolling(period).max()
+    rsv = ((close - lowest_low) / (highest_high - lowest_low)) * 100
+    rsv = rsv.replace([np.inf, -np.inf], np.nan).fillna(0)
+    k_val = rsv.ewm(alpha=1 / k_smooth, adjust=False).mean()
+    d_val = k_val.ewm(alpha=1 / d_smooth, adjust=False).mean()
+    return k_val, d_val
+
+
 @st.cache_data(show_spinner=False)
 def fetch_twse_stock_name(symbol):
     """從 TWSE 月資料 API 的 title 欄位拆出股票名稱。"""
@@ -76,9 +87,21 @@ def fetch_twse_stock_name(symbol):
             "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
             f"?response=json&date={api_date}&stockNo={code}"
         )
+        request = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://www.twse.com.tw/",
+            },
+        )
 
         try:
-            with urlopen(url, timeout=10) as response:
+            with urlopen(request, timeout=10) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (URLError, TimeoutError, json.JSONDecodeError):
             continue
@@ -95,7 +118,7 @@ def fetch_twse_stock_name(symbol):
         if stock_name:
             return stock_name
 
-    return ""
+    return "查無名稱"
 
 
 def check_taiwan_stock(symbol, strict_trend=True):
@@ -119,6 +142,7 @@ def check_taiwan_stock(symbol, strict_trend=True):
     direction, _ = calculate_supertrend(high, low, close, period=6, multiplier=0.686)
     cci_val = calculate_cci(high, low, close, length=20)
     cci_ma = cci_val.rolling(14).mean()
+    k_val, d_val = calculate_kd(high, low, close)
 
     current_idx = -1
     prev_idx = -2
@@ -128,9 +152,14 @@ def check_taiwan_stock(symbol, strict_trend=True):
         cci_val.iloc[prev_idx] <= cci_ma.iloc[prev_idx]
         and cci_val.iloc[current_idx] > cci_ma.iloc[current_idx]
     )
+    kd_in_range = (
+        k_val.iloc[current_idx] <= 50
+        and d_val.iloc[current_idx] <= 50
+        and min(k_val.iloc[current_idx], d_val.iloc[current_idx]) <= 30
+    )
 
     allow_buy = is_green_trend if strict_trend else True
-    trigger_new_buy = cci_cross_up and allow_buy
+    trigger_new_buy = cci_cross_up and kd_in_range and allow_buy
 
     if trigger_new_buy:
         stock_code = symbol.replace(".TW", "").replace(".TWO", "")
@@ -139,6 +168,8 @@ def check_taiwan_stock(symbol, strict_trend=True):
             "股票名稱": fetch_twse_stock_name(stock_code),
             "最新收盤價": round(float(close.iloc[current_idx]), 2),
             "CCI 數值": round(float(cci_val.iloc[current_idx]), 2),
+            "K 值": round(float(k_val.iloc[current_idx]), 2),
+            "D 值": round(float(d_val.iloc[current_idx]), 2),
             "Supertrend 狀態": "🟢 多頭" if is_green_trend else "🔴 空頭",
             "交易日": df.index[-1].strftime("%Y-%m-%d"),
         }
