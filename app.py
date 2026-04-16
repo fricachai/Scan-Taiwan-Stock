@@ -2,7 +2,11 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import streamlit as st
+import json
+import re
 from datetime import datetime
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 def calculate_cci(high, low, close, length=20):
@@ -57,6 +61,43 @@ def calculate_supertrend(high, low, close, period=6, multiplier=0.686):
     return direction, supertrend
 
 
+@st.cache_data(show_spinner=False)
+def fetch_twse_stock_name(symbol):
+    """從 TWSE 月資料 API 的 title 欄位拆出股票名稱。"""
+    code = symbol.replace(".TW", "").replace(".TWO", "")
+    month_starts = [
+        pd.Timestamp.today().replace(day=1),
+        pd.Timestamp.today().replace(day=1) - pd.DateOffset(months=1),
+    ]
+
+    for month_start in month_starts:
+        api_date = month_start.strftime("%Y%m01")
+        url = (
+            "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+            f"?response=json&date={api_date}&stockNo={code}"
+        )
+
+        try:
+            with urlopen(url, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            continue
+
+        if payload.get("stat") != "OK":
+            continue
+
+        title = " ".join(str(payload.get("title", "")).split())
+        match = re.search(rf"{re.escape(code)}\s+(.+)", title)
+        if not match:
+            continue
+
+        stock_name = next((part for part in match.group(1).split(" ") if part), "")
+        if stock_name:
+            return stock_name
+
+    return ""
+
+
 def check_taiwan_stock(symbol, strict_trend=True):
     """檢驗單檔股票是否符合 CCI 雙向轉折 (多單) 條件。"""
     yf_symbol = symbol if symbol.endswith(".TW") or symbol.endswith(".TWO") else f"{symbol}.TW"
@@ -92,8 +133,10 @@ def check_taiwan_stock(symbol, strict_trend=True):
     trigger_new_buy = cci_cross_up and allow_buy
 
     if trigger_new_buy:
+        stock_code = symbol.replace(".TW", "").replace(".TWO", "")
         return {
-            "股票代號": symbol.replace(".TW", "").replace(".TWO", ""),
+            "股票代號": stock_code,
+            "股票名稱": fetch_twse_stock_name(stock_code),
             "最新收盤價": round(float(close.iloc[current_idx]), 2),
             "CCI 數值": round(float(cci_val.iloc[current_idx]), 2),
             "Supertrend 狀態": "🟢 多頭" if is_green_trend else "🔴 空頭",
