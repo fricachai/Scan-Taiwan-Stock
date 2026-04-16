@@ -232,14 +232,8 @@ def check_taiwan_stock(symbol, strict_trend=True):
         cci_val.iloc[prev_idx] <= cci_ma.iloc[prev_idx]
         and cci_val.iloc[current_idx] > cci_ma.iloc[current_idx]
     )
-    kd_in_range = (
-        k_val.iloc[current_idx] <= 50
-        and d_val.iloc[current_idx] <= 50
-        and min(k_val.iloc[current_idx], d_val.iloc[current_idx]) <= 30
-    )
-
     allow_buy = is_green_trend if strict_trend else True
-    trigger_new_buy = cci_cross_up and kd_in_range and allow_buy
+    trigger_new_buy = cci_cross_up and allow_buy
 
     if trigger_new_buy:
         stock_code = symbol.replace(".TW", "").replace(".TWO", "")
